@@ -1,0 +1,557 @@
+Create a Next.js App Router project with:
+
+1) app/api/txs/route.ts
+
+Edge runtime.
+
+GET /api/txs?address=0x...&includeInternal=1
+
+Validates the address.
+
+Fetches all normal transactions via Etherscan txlist using pagination (page/offset=10000, sort=asc).
+
+Optionally fetches internal ETH transfers via txlistinternal if includeInternal=1.
+
+Computes gas fee (ETH) for normal txs: gasUsed * gasPrice.
+
+Fetches CoinGecko market_chart/range once for the full timestamp span; maps each tx to USD at tx time (nearest datapoint).
+
+Returns enriched rows (ready for display & CSV).
+
+Uses process.env.ETHERSCAN_API_KEY if present (recommended). Falls back to no key (may rate-limit).
+
+// app/api/txs/route.ts
+export const runtime = "edge";
+export const dynamic = "force-dynamic";
+
+const ETHERSCAN_API = "https://api.etherscan.io/api";
+const COINGECKO_RANGE = "https://api.coingecko.com/api/v3/coins/ethereum/market_chart/range";
+const MAX_PAGES = 20;            // up to 200k txs with offset=10000
+const OFFSET = 10000;            // Etherscan max per page
+const USD_DECIMALS = 2;
+
+function jsonRes(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET,OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    },
+  });
+}
+
+function isEthAddress(addr: string) {
+  return /^0x[a-fA-F0-9]{40}$/.test(addr.trim());
+}
+
+type NormalTx = {
+  blockNumber: string;
+  timeStamp: string;
+  hash: string;
+  from: string;
+  to: string | null;
+  value: string;       // wei (string)
+  gasPrice: string;    // wei
+  gasUsed: string;     // units
+  txreceipt_status?: string; // "1"|"0"
+  isError?: string;           // "0"|"1"
+};
+
+type InternalTx = {
+  blockNumber: string;
+  timeStamp: string;
+  hash: string;
+  from: string;
+  to: string | null;
+  value: string;       // wei
+  isError: string;     // "0"|"1"
+  type?: string;       // "call", etc.
+};
+
+async function fetchEtherscanPage(params: Record<string, string>) {
+  const apikey = (process.env.ETHERSCAN_API_KEY || "").trim();
+  const url = new URL(ETHERSCAN_API);
+  Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
+  if (apikey) url.searchParams.set("apikey", apikey);
+
+  const res = await fetch(url.toString(), { headers: { Accept: "application/json" } });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`Etherscan HTTP ${res.status}: ${text.slice(0, 200)}`);
+
+  let json: any;
+  try { json = JSON.parse(text); } catch { throw new Error(`Etherscan bad JSON: ${text.slice(0, 200)}`); }
+
+  // Etherscan "status" can be "0" for "No transactions found"
+  if (json.message === "No transactions found") return [] as any[];
+  if (json.status !== "1" && json.message !== "OK") {
+    // Some responses use status "0" but still include "result" array; handle that too
+    if (Array.isArray(json.result)) return json.result;
+    throw new Error(json.result || json.message || "Unexpected Etherscan response");
+  }
+  return Array.isArray(json.result) ? json.result : [];
+}
+
+async function fetchAllNormal(address: string): Promise<NormalTx[]> {
+  const rows: NormalTx[] = [];
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const pageRows = await fetchEtherscanPage({
+      module: "account",
+      action: "txlist",
+      address,
+      startblock: "0",
+      endblock: "99999999",
+      page: String(page),
+      offset: String(OFFSET),
+      sort: "asc",
+    });
+    if (pageRows.length === 0) break;
+    rows.push(...pageRows);
+    if (pageRows.length < OFFSET) break;
+  }
+  return rows;
+}
+
+async function fetchAllInternal(address: string): Promise<InternalTx[]> {
+  const rows: InternalTx[] = [];
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const pageRows = await fetchEtherscanPage({
+      module: "account",
+      action: "txlistinternal",
+      address,
+      startblock: "0",
+      endblock: "99999999",
+      page: String(page),
+      offset: String(OFFSET),
+      sort: "asc",
+    });
+    if (pageRows.length === 0) break;
+    rows.push(...pageRows);
+    if (pageRows.length < OFFSET) break;
+  }
+  return rows;
+}
+
+function formatEtherFromWeiStr(weiStr: string, decimals = 6) {
+  try {
+    const wei = BigInt(weiStr);
+    const BASE = 10n ** 18n;
+    const whole = wei / BASE;
+    const frac = wei % BASE;
+    const fracStr = frac.toString().padStart(18, "0").slice(0, decimals).replace(/0+$/, "");
+    return fracStr ? `${whole}.${fracStr}` : whole.toString();
+  } catch {
+    return "0";
+  }
+}
+
+function computeGasFeeEth(t: NormalTx, decimals = 6) {
+  try {
+    const feeWei = BigInt(t.gasUsed) * BigInt(t.gasPrice);
+    return formatEtherFromWeiStr(feeWei.toString(), decimals);
+  } catch {
+    return "0";
+  }
+}
+
+function statusOfNormal(t: NormalTx): "Success" | "Failed" | "Pending" {
+  if (t.txreceipt_status === "1" && t.isError !== "1") return "Success";
+  if (t.txreceipt_status === "0" || t.isError === "1") return "Failed";
+  return "Pending";
+}
+function statusOfInternal(t: InternalTx): "Success" | "Failed" | "Pending" {
+  if (t.isError === "1") return "Failed";
+  // Internal traces are by definition executed; if parent pending, Etherscan often omits them.
+  return "Success";
+}
+
+function classifyType(addressLc: string, from?: string | null, to?: string | null, isInternal = false) {
+  const fromLc = (from || "").toLowerCase();
+  const toLc = (to || "").toLowerCase();
+
+  const recv = toLc === addressLc && fromLc !== addressLc;
+  const sent = fromLc === addressLc && toLc !== addressLc;
+  const self = fromLc === addressLc && toLc === addressLc;
+  const contractCreation = fromLc === addressLc && (!to || to === "" || to === "0x");
+
+  let base =
+    contractCreation ? "Contract Creation" :
+    self ? "Self" :
+    recv ? "Received" :
+    sent ? "Sent" :
+    "Other";
+
+  if (isInternal) base = base.startsWith("Received") ? "Internal Received"
+              : base.startsWith("Sent") ? "Internal Sent"
+              : base === "Self" ? "Internal Self"
+              : base === "Contract Creation" ? "Internal Contract Creation"
+              : "Internal";
+  return base;
+}
+
+function nearestUsd(tsSec: number, priceSeries: Array<[number, number]>): number | null {
+  // priceSeries: [ [ts_ms, price], ... ] sorted asc
+  if (!priceSeries.length) return null;
+  const target = tsSec * 1000;
+  // Binary search
+  let lo = 0, hi = priceSeries.length - 1;
+  while (lo < hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (priceSeries[mid][0] < target) lo = mid + 1;
+    else hi = mid;
+  }
+  const cand = priceSeries[lo];
+  const prev = priceSeries[Math.max(0, lo - 1)];
+  const distCand = Math.abs(cand[0] - target);
+  const distPrev = Math.abs(prev[0] - target);
+  const best = distPrev <= distCand ? prev : cand;
+  return typeof best?.[1] === "number" ? best[1] : null;
+}
+
+export async function GET(req: Request) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const address = (searchParams.get("address") || "").trim();
+    const includeInternal = searchParams.get("includeInternal") === "1";
+
+    if (!isEthAddress(address)) return jsonRes({ error: "Invalid Ethereum address." }, 400);
+    const addressLc = address.toLowerCase();
+
+    // 1) Fetch normal txs (paginated)
+    const normal = await fetchAllNormal(address);
+    // 2) Optionally fetch internal value transfers
+    const internal = includeInternal ? await fetchAllInternal(address) : [];
+
+    // 3) Determine timestamp range for USD pricing
+    const allTs = [
+      ...normal.map(x => Number(x.timeStamp)),
+      ...internal.map(x => Number(x.timeStamp)),
+    ].filter(n => Number.isFinite(n));
+    const minTs = allTs.length ? Math.min(...allTs) : 0;
+    const maxTs = allTs.length ? Math.max(...allTs) : 0;
+
+    // 4) Fetch historical USD prices once (CoinGecko range)
+    let priceSeries: Array<[number, number]> = [];
+    if (minTs && maxTs) {
+      const from = Math.max(0, minTs - 3600);     // pad 1h
+      const to = maxTs + 3600;
+      const cgUrl = `${COINGECKO_RANGE}?vs_currency=usd&from=${from}&to=${to}`;
+      const cgRes = await fetch(cgUrl, { headers: { Accept: "application/json" } });
+      if (cgRes.ok) {
+        const cgJson: any = await cgRes.json();
+        if (Array.isArray(cgJson?.prices)) {
+          // prices: [ [ts_ms, price], ... ]
+          priceSeries = cgJson.prices as Array<[number, number]>;
+        }
+      }
+    }
+
+    // 5) Normalize rows
+    const normalRows = normal.map(n => {
+      const status = statusOfNormal(n);
+      const type = classifyType(addressLc, n.from, n.to, false);
+      const valueEth = formatEtherFromWeiStr(n.value, 8);
+      const gasFeeEth = computeGasFeeEth(n, 8);
+      const usd = priceSeries.length ? nearestUsd(Number(n.timeStamp), priceSeries) : null;
+      const valueUsd = usd ? (Number(valueEth) * usd) : null;
+
+      return {
+        kind: "normal" as const,
+        hash: n.hash,
+        timeStamp: Number(n.timeStamp),
+        dateTimeUtc: new Date(Number(n.timeStamp) * 1000).toISOString(),
+        status,
+        type,
+        from: n.from,
+        to: n.to || "",
+        valueEth,
+        valueUsd: valueUsd !== null ? Number(valueUsd.toFixed(USD_DECIMALS)) : null,
+        gasFeeEth,
+        explorerUrl: `https://etherscan.io/tx/${n.hash}`,
+      };
+    });
+
+    const internalRows = internal.map(n => {
+      const status = statusOfInternal(n);
+      const type = classifyType(addressLc, n.from, n.to, true);
+      const valueEth = formatEtherFromWeiStr(n.value, 8);
+      const usd = priceSeries.length ? nearestUsd(Number(n.timeStamp), priceSeries) : null;
+      const valueUsd = usd ? (Number(valueEth) * usd) : null;
+      // Internal traces don't have an isolated gas fee; show null/empty.
+      return {
+        kind: "internal" as const,
+        hash: n.hash,
+        timeStamp: Number(n.timeStamp),
+        dateTimeUtc: new Date(Number(n.timeStamp) * 1000).toISOString(),
+        status,
+        type,
+        from: n.from,
+        to: n.to || "",
+        valueEth,
+        valueUsd: valueUsd !== null ? Number(valueUsd.toFixed(USD_DECIMALS)) : null,
+        gasFeeEth: null as null | string,
+        explorerUrl: `https://etherscan.io/tx/${n.hash}`,
+      };
+    });
+
+    // 6) Combine and sort desc (newest first)
+    const all = [...normalRows, ...internalRows].sort((a, b) => b.timeStamp - a.timeStamp);
+
+    return jsonRes({ address, count: all.length, rows: all });
+  } catch (e: any) {
+    return jsonRes({ error: e?.message || "Server error" }, 500);
+  }
+}
+
+2) app/page.tsx
+
+Client page to:
+
+Input address
+
+Toggle “Include internal transfers” (optional)
+
+Fetch all rows from /api/txs
+
+Render entire table (no artificial 10-row cap)
+
+Download CSV with the same columns you requested
+
+// app/page.tsx
+"use client";
+import React, { useCallback, useMemo, useState } from "react";
+
+function isEthAddress(addr: string) {
+  return /^0x[a-fA-F0-9]{40}$/.test(addr.trim());
+}
+
+type Row = {
+  kind: "normal" | "internal";
+  hash: string;
+  timeStamp: number;
+  dateTimeUtc: string;
+  status: "Success" | "Failed" | "Pending";
+  type: string;
+  from: string;
+  to: string;
+  valueEth: string;
+  valueUsd: number | null;
+  gasFeeEth: string | null;
+  explorerUrl: string;
+};
+
+export default function Page() {
+  const [address, setAddress] = useState("");
+  const [includeInternal, setIncludeInternal] = useState(true);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [rows, setRows] = useState<Row[]>([]);
+
+  const canQuery = useMemo(() => isEthAddress(address), [address]);
+
+  const getTxs = useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    setRows([]);
+    if (!canQuery) {
+      setLoading(false);
+      setError("Invalid Ethereum address. Please enter a 0x…40-hex address.");
+      return;
+    }
+    try {
+      const url = `/api/txs?address=${encodeURIComponent(
+        address.trim()
+      )}${includeInternal ? "&includeInternal=1" : ""}`;
+      const res = await fetch(url, { headers: { Accept: "application/json" } });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+      if (!Array.isArray(json?.rows)) throw new Error("Malformed server response");
+      setRows(json.rows as Row[]);
+    } catch (e: any) {
+      setError(e?.message || "Failed to fetch transactions.");
+    } finally {
+      setLoading(false);
+    }
+  }, [address, canQuery, includeInternal]);
+
+  function downloadCSV() {
+    if (!rows.length) return;
+    const headers = [
+      "hash",
+      "datetime_utc",
+      "status",
+      "type",
+      "from",
+      "to",
+      "value_eth",
+      "value_usd_at_tx",
+      "gas_fee_eth",
+      "explorer_url",
+    ];
+    const csvRows = rows.map((r) => {
+      const cells = [
+        r.hash,
+        r.dateTimeUtc.replace("T", " ").replace(".000Z", " UTC"),
+        r.status,
+        r.type,
+        r.from,
+        r.to,
+        r.valueEth,
+        r.valueUsd !== null ? r.valueUsd.toFixed(2) : "",
+        r.gasFeeEth ?? "",
+        r.explorerUrl,
+      ];
+      return cells
+        .map((c) => {
+          const s = String(c ?? "");
+          return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+        })
+        .join(",");
+    });
+    const csv = [headers.join(","), ...csvRows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `transactions_${address.trim()}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  return (
+    <div style={{ maxWidth: 1200, margin: "40px auto", fontFamily: "Inter, system-ui, sans-serif" }}>
+      <h1>Ethereum Transactions</h1>
+
+      <div style={{ display: "grid", gridTemplateColumns: "minmax(300px,1fr) auto auto auto", gap: 12, alignItems: "end" }}>
+        <label style={{ display: "block" }}>
+          <div><b>Wallet address</b></div>
+          <input
+            type="text"
+            value={address}
+            onChange={(e) => setAddress(e.target.value)}
+            placeholder="0x..."
+            spellCheck={false}
+            style={{ width: "100%", padding: "10px 12px", borderRadius: 8, border: "1px solid #ddd", fontSize: 14, marginTop: 6 }}
+          />
+        </label>
+
+        <label style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={includeInternal}
+            onChange={(e) => setIncludeInternal(e.target.checked)}
+          />
+          Include internal transfers
+        </label>
+
+        <button
+          disabled={loading || !canQuery}
+          onClick={getTxs}
+          style={{ padding: "10px 14px", borderRadius: 8, border: "1px solid #111", background: "#111", color: "#fff", cursor: "pointer", minWidth: 140 }}
+        >
+          {loading ? "Loading…" : "GET TRANSACTIONS"}
+        </button>
+
+        <button
+          disabled={!rows.length}
+          onClick={downloadCSV}
+          style={{ padding: "10px 14px", borderRadius: 8, border: "1px solid #555", background: "#fff", color: "#111", cursor: rows.length ? "pointer" : "not-allowed", minWidth: 140 }}
+        >
+          Download CSV
+        </button>
+      </div>
+
+      {!canQuery && address && (
+        <div style={{ marginTop: 8, color: "#666" }}>
+          Enter a valid Ethereum address (0x + 40 hex chars).
+        </div>
+      )}
+      {error && <div style={{ marginTop: 12, color: "#b00020", whiteSpace: "pre-wrap" }}>{error}</div>}
+
+      <div style={{ marginTop: 20, overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse" }}>
+          <thead>
+            <tr>
+              {["Hash", "Date/Time (UTC)", "Status", "Type", "From", "To", "Value (ETH)", "Value (USD @ tx)", "Gas Fee (ETH)"].map((h) => (
+                <th key={h} style={{ textAlign: "left", borderBottom: "1px solid #eee", padding: "10px 8px", fontWeight: 600 }}>
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {!rows.length ? (
+              <tr>
+                <td colSpan={9} style={{ padding: 16, color: "#666" }}>
+                  {loading ? "Loading…" : "No transactions to display."}
+                </td>
+              </tr>
+            ) : (
+              rows.map((r) => {
+                const hashShort = `${r.hash.slice(0, 10)}…${r.hash.slice(-8)}`;
+                const fromShort = `${r.from.slice(0, 10)}…${r.from.slice(-8)}`;
+                const toShort = r.to ? `${r.to.slice(0, 10)}…${r.to.slice(-8)}` : "";
+                return (
+                  <tr key={`${r.kind}-${r.hash}-${r.timeStamp}`}>
+                    <td style={{ padding: "10px 8px", borderBottom: "1px solid #f5f5f5" }}>
+                      <a href={r.explorerUrl} target="_blank" rel="noreferrer" style={{ color: "#1a73e8", textDecoration: "none" }}>
+                        {hashShort}
+                      </a>
+                    </td>
+                    <td style={{ padding: "10px 8px", borderBottom: "1px solid #f5f5f5" }}>
+                      {r.dateTimeUtc.replace("T", " ").replace(".000Z", " UTC")}
+                    </td>
+                    <td style={{ padding: "10px 8px", borderBottom: "1px solid #f5f5f5" }}>{r.status}</td>
+                    <td style={{ padding: "10px 8px", borderBottom: "1px solid #f5f5f5" }}>{r.type}</td>
+                    <td style={{ padding: "10px 8px", borderBottom: "1px solid #f5f5f5" }}>{fromShort}</td>
+                    <td style={{ padding: "10px 8px", borderBottom: "1px solid #f5f5f5" }}>{toShort}</td>
+                    <td style={{ padding: "10px 8px", borderBottom: "1px solid #f5f5f5" }}>{r.valueEth}</td>
+                    <td style={{ padding: "10px 8px", borderBottom: "1px solid #f5f5f5" }}>
+                      {r.valueUsd !== null ? `$${r.valueUsd.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}
+                    </td>
+                    <td style={{ padding: "10px 8px", borderBottom: "1px solid #f5f5f5" }}>
+                      {r.gasFeeEth !== null ? r.gasFeeEth : "—"}
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      <div style={{ marginTop: 16, color: "#666" }}>
+        <small>Data: Etherscan (normal{includeInternal ? " + internal" : ""}) • USD at tx: CoinGecko</small>
+      </div>
+    </div>
+  );
+}
+
+3) tsconfig.json (ensure BigInt + DOM)
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "lib": ["DOM", "ES2020"],
+    "jsx": "preserve",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "allowJs": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true
+  }
+}
+
+Notes to keep costs low & behavior correct
+
+Add ETHERSCAN_API_KEY in environment if possible (fewer rate limits).
+
+Server route paginates until it collects all transactions (up to MAX_PAGES * OFFSET). Adjust MAX_PAGES if your addresses exceed 200k txs.
+
+USD at time is computed by mapping the tx timestamp to the nearest price in a single CoinGecko range call — efficient and accurate enough for MVP.
+
+Gas fee shown for normal txs; internal traces don’t have an isolated gas fee (display “—”).
+
+Table renders all rows; if you expect tens of thousands, consider adding a client-side “Show N / pagination” later to avoid heavy DOM.
