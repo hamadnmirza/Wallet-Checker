@@ -1,15 +1,15 @@
 Wallet Tracker: 
 
-Wallet Tracker is a simple web app that lets users check their crypto wallet balances, view historical transactions, and export transaction histories to CSV. 
-Built with Next.js, v0.dev, and shadcn/ui, it connects to Tatum, Etherscan, and CoinGecko APIs to pull accurate blockchain and market data securely. No wallet connection needed. 
+- Wallet Tracker is a simple web app that lets users check their crypto wallet balances, view historical transactions, and export transaction histories to CSV. 
+- Built with Next.js, v0.dev, and shadcn/ui, it connects to Tatum, Etherscan, and CoinGecko APIs to pull accurate blockchain and market data securely. No wallet connection needed. 
 
 Features: 
 
-Transaction history: view all incoming and outgoing transactions per wallet address.
-CSV export: download transaction data for accounting, reporting, or tax purposes.
-Real-time USD values: integrates Etherscan and CoinGecko to display live pricing.
-Clean, responsive UI: optimized for speed and readability. 
-Secure: reads only public blockchain data; no wallet connection or private keys.
+- Transaction history: view all incoming and outgoing transactions per wallet address.
+- CSV export: download transaction data for accounting, reporting, or tax purposes.
+- Real-time USD values: integrates Etherscan and CoinGecko to display live pricing.
+- Clean, responsive UI: optimized for speed and readability. 
+- Secure: reads only public blockchain data; no wallet connection or private keys.
 
 
 Here are some previews of the app in action:
@@ -18,18 +18,18 @@ Here are some previews of the app in action:
 
 Roadmap: 
 
-Add Solana support (coming soon 🚀). 
-Multi-wallet dashboard. 
-Portfolio analytics (PnL, token weighting).  
-Export to Google Sheets. 
+- Add Solana support (coming soon 🚀). 
+- Multi-wallet dashboard. 
+- Portfolio analytics (PnL, token weighting).  
+- Export to Google Sheets. 
 
 
 Tech Stack
-Framework: Next.js, v0.dev
-UI: shadcn/ui, Tailwind CSS
-Language: TypeScript
-Blockchain Data: Tatum API
-Market Data: CoinGecko API, Etherscan API
-Deployment: Vercel (specifically v0.dev). 
+- Framework: Next.js, v0.dev
+- UI: shadcn/ui, Tailwind CSS
+- Language: TypeScript
+- Blockchain Data: Tatum API
+- Market Data: CoinGecko API, Etherscan API
+- Deployment: Vercel (specifically v0.dev). 
 
 This is a personal portfolio project built for learning and demonstration purposes.
