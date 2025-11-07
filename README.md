@@ -11,7 +11,6 @@ Real-time USD values: integrates Etherscan and CoinGecko to display live pricing
 Clean, responsive UI: optimized for speed and readability. 
 Secure: reads only public blockchain data; no wallet connection or private keys.
 
-Demo:
 
 Here are some previews of the app in action:
 
